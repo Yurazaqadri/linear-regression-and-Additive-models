@@ -1,0 +1,195 @@
+---
+title: "Working linear regression models"
+author: "Yuraja Kadari"
+output: 
+  html_document:
+   toc: true
+   toc_float: true
+   toc_level: 3
+   theme: lumen
+---
+
+```{r setup, include=FALSE}
+require(tidymodels)
+require(tidyverse)
+require(ggpubr)
+```
+
+# Improving Predictions
+
+## Dataset and Running Example
+
+We will be using Kickstarter projects dataset. It is available both at: <https://ygenc.github.io/lectures/data/projects.csv>
+
+Our goal is to create a model that will predict amount raised based on other variables:
+
+$f(raised ~.)$
+
+```{r}
+projects=read_csv(url('https://ygenc.github.io/lectures/data/projects.csv'))
+#projects=projects%>%select(-id)
+```
+
+```{r}
+projects%>%head()
+```
+
+## Baseline
+
+> Let's create a model with training data and check its accuracy on the testing site. Note that cross-fold validation of the process is also presented, but commented out.
+
+```{r}
+set.seed(2025)
+
+project_split=initial_split(projects, prop=.8)
+project_training=training(project_split)
+project_testing=testing(project_split)
+
+```
+
+```{r}
+set.seed(1234)
+ folds=vfold_cv(project_training , v=5)
+
+ my_model_cv<-linear_reg()%>%
+            set_engine('lm')%>%
+             fit_resamples(raised ~., folds)
+
+ collect_metrics(my_model_cv)%>%mutate(across(where(is.numeric), ~round(.x, 2)))
+```
+
+```{r}
+main_rec<-recipe(raised~., project_training)%>%
+          update_role(id, new_role='id variable') %>%
+          #step_YeoJohnson(all_numeric(), - all_outcomes()) %>% ##
+          step_dummy(all_nominal(), -all_outcomes()) %>%
+          step_nzv(all_predictors())
+
+reg_model<-linear_reg()%>%
+  set_engine('lm')
+
+reg_flow<-workflow()%>%
+  add_model(reg_model)%>%
+  add_recipe(main_rec)
+```
+
+```{r}
+reg_fit<-reg_flow%>%
+  fit(project_training)
+tidy(reg_fit)
+
+## Cross validated 
+ set.seed(1234)
+folds=vfold_cv(project_training , v=5)
+reg_cv_fit<-reg_flow%>%
+ fit_resamples(folds)
+reg_cv_fit 
+```
+
+```{r}
+reg_results=predict(reg_fit, project_testing)%>%
+  bind_cols(project_testing%>%select(raised))
+```
+
+## More on Metrics
+
+> The results below show us how the accuracy of the model is on the training data (which was not used while creating the model).
+
+```{r}
+multi_metric<-metric_set(rsq, rmse,mae, mape)
+
+multi_metric(reg_results, truth=raised+1, estimate=.pred)%>%
+  mutate(across(where(is.numeric), ~round(.x,2)))
+```
+
+> Our next step is to see how we can improve on this. Let's start with studying the output variable - raised column.
+
+### Transforming Output Variables
+
+> Which of the distributions below seems to be more normal-like (log transformed of the 'raised' -l_raised or the raised column as it is)? Since l_raised seems to be more normal like, we expect the predictions with linear regression on the log-transformed output to be more accurate
+
+```{r fig.height=3}
+projects%>%ggplot()+geom_density(aes(x=raised))
+projects%>%mutate(l_raised=log(raised+1))%>% ggplot()+geom_density(aes(x=l_raised))
+
+
+projects%>%select(raised)%>%mutate(l_raised=log(raised+2))%>%
+                    gather(key='key', value = 'val')%>%
+                    ggplot()+geom_density(aes(x=val, color=key))+facet_wrap(key~.,  scales = 'free')
+                        
+```
+
+> Let's re-fit a model on the transformed data. But first let's make a few adjustments. Log of 0 is -inf so we can't use rows where raised is 0 if we choose to log tranform them. In situations like this we add a very small number to the column to be transformed (raised). This doesn't drastically change the distributions and hopefully won't be a big deal for the overall model creation (i.e. raising \$1000 is pretty similar to raising \$1001) We also don't want to logged transformed values to be 0 (we won't be able to calculate relative errors such as mape), adding only 1 is not enough ( log(0+1) = 0 ). So we will add 2 ( adding something like 1.1 will also work)
+
+```{r}
+l_recipe<-main_rec%>%step_log(raised, offset=1, skip=TRUE)
+
+l_flow<-reg_flow%>%update_recipe(l_recipe)
+
+l_fit<-l_flow%>%fit(project_training)
+
+```
+
+> Next step is to evaluate the model by comparing predicted values (.pred ) to the true values (l_raised) in the testing set. However, the errors in the logged transformed data will be significantly lower than the actuall values. Imagine a scenario where the raised value was 1,000,000 and prediction was 1,000. The true error is 999,000. But since we log tranformed the raised column and the predictions are also on the logged transformed data, in this model the errors will be log(1000000)-log(1000) = 13.8 - 6.9 = 6.9. So if we want to compare this model to the non_transformed model, we need to reverse the log tranformation on the .pred and l_raised columns. Below we do so by applyin exp() function on these columns before calculating the metrics
+
+```{r}
+results_l=predict(l_fit, project_testing)%>%bind_cols(project_testing%>%select(raised))
+
+multi_metric(results_l, truth=raised+1 , estimate=exp(.pred))%>%
+  mutate(across(where(is.numeric), ~round(.x,2)))
+
+```
+
+> The results above show that our rmse is higher (so it may look like our model got worse), band it is not suprising as log transformed model typically lead to higher rmse values. Actually with skewed data what we are interested in the relative error measures. Relative measures asks the question of what is the ratio of the error to the true value. MAPE is one of them. And if you compare the MAPE values you will see that the value is lower than the mape of the previous run. So our model works better with log transformations.
+
+## Interactions with Tidymodels
+
+> We can further improve our model by adding interaction terms. Interaction terms suggest the impact of one variable on the outcome can vary based on another variable. Here we add an interaction term between duration and parentCat and check if the model is performing better.
+
+```{r}
+i_recipe<-l_recipe%>%
+ # step_dummy(parentCat)%>%
+  step_interact(terms=~duration:starts_with('parentCat'))
+
+#i_recipe%>%prep%>%bake(project_training)
+
+i_flow<-reg_flow%>%update_recipe(i_recipe)
+
+i_fit<-i_flow%>%fit(project_training)
+
+```
+
+```{r}
+results_i=predict(i_fit, project_testing)%>%
+  bind_cols(project_testing%>%select(raised))
+
+multi_metric(results_i, truth=raised+1, estimate=exp(.pred))%>%
+  mutate(across(where(is.numeric), ~round(.x,2)))
+
+```
+
+## Generalized Additive Models
+
+```{r}
+
+additive_model<-gen_additive_mod(mode='regression',
+                                 select_features=TRUE,
+                                 adjust_deg_free=4)%>%
+  set_engine('mgcv')
+
+a_model<-additive_model%>% fit(log(raised+1)~parentCat+
+        s(duration)+
+        s(goal)+
+        s(faqs)+
+        comments+
+        description.length+
+        duration:parentCat, data=project_training)
+
+
+results_a=predict(a_model, project_testing)%>%
+  bind_cols(project_testing%>%select(raised))
+
+multi_metric(results_a, truth=raised+1, estimate=exp(.pred))%>%
+   mutate(across(where(is.numeric), ~round(.x, 2)))
+
+```
